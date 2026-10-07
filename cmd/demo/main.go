@@ -25,14 +25,16 @@ func runDemo() {
 		return model.Labels{{Name: "host", Value: host}}
 	}
 
-	// High CPU for 30s triggers after a 15s "for" guard.
+	// High CPU for 15s triggers; recovery needs 10s of continuous
+	// contradiction so single glitches don't flap the alert.
 	highCPU := model.Rule{
-		ID:          "high_cpu",
-		Metric:      "cpu.usage",
-		Match:       map[string]string{},
-		Operator:    model.OpGt,
-		Threshold:   90,
-		ForDuration: 15 * time.Second,
+		ID:              "high_cpu",
+		Metric:          "cpu.usage",
+		Match:           map[string]string{},
+		Operator:        model.OpGt,
+		Threshold:       90,
+		ForDuration:     15 * time.Second,
+		ResolveDuration: 10 * time.Second,
 	}
 
 	p := pipeline.New(pipeline.Config{
@@ -55,8 +57,15 @@ func runDemo() {
 	batch := []model.Sample{
 		{Metric: "cpu.usage", Labels: cpu("a"), Value: 95, Timestamp: at(5), Source: "node-a"},
 		{Metric: "cpu.usage", Labels: cpu("a"), Value: 96, Timestamp: at(10), Source: "node-a"},
-		{Metric: "cpu.usage", Labels: cpu("a"), Value: 97, Timestamp: at(25), Source: "node-a"}, // fires
-		{Metric: "cpu.usage", Labels: cpu("a"), Value: 70, Timestamp: at(40), Source: "node-a"}, // resolves
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 97, Timestamp: at(25), Source: "node-a"}, // fires (cycle 1)
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 70, Timestamp: at(40), Source: "node-a"}, // recovery hold starts
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 99, Timestamp: at(45), Source: "node-a"}, // glitch: hold cancelled
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 60, Timestamp: at(50), Source: "node-a"}, // hold restarts
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 60, Timestamp: at(60), Source: "node-a"}, // resolves (cycle 1)
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 95, Timestamp: at(70), Source: "node-a"}, // round 2 pending
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 96, Timestamp: at(85), Source: "node-a"}, // fires again (cycle 2)
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 60, Timestamp: at(95), Source: "node-a"},
+		{Metric: "cpu.usage", Labels: cpu("a"), Value: 60, Timestamp: at(105), Source: "node-a"}, // resolves (cycle 2)
 		{Metric: "cpu.usage", Labels: cpu("b"), Value: 99, Timestamp: at(5), Source: "node-b"},
 		{Metric: "cpu.usage", Labels: cpu("b"), Value: 99, Timestamp: at(25), Source: "node-b"}, // fires but silenced
 		{Metric: "cpu.usage", Labels: cpu("b"), Value: 80, Timestamp: at(45), Source: "node-b"}, // not silenced -> recovery delivered
@@ -127,8 +136,12 @@ func (pipelinePrinter) Notify(ev model.Event) {
 	}
 	switch ev.Type {
 	case model.EventFiring, model.EventResolved, model.EventSuppressed:
-		fmt.Printf("[notify %s] %s host=%s silence=%s\n",
-			ev.Time.Format("15:04:05"), ev.Type, host, ev.SilenceID)
+		cycle := 0
+		if ev.State != nil {
+			cycle = ev.State.Cycle
+		}
+		fmt.Printf("[notify %s] %s host=%s cycle=%d silence=%s\n",
+			ev.Time.Format("15:04:05"), ev.Type, host, cycle, ev.SilenceID)
 	}
 }
 

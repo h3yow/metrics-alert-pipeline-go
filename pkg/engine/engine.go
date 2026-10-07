@@ -1,6 +1,6 @@
 // Package engine evaluates alert rules against samples and maintains the
 // inactive -> pending -> firing state machine with duration ("for") and
-// flapping protection.
+// flapping protection on both the trigger and the recovery side.
 //
 // State rules:
 //
@@ -10,8 +10,15 @@
 //     waiting timer (short flapping never alerts).
 //   - firing:   condition held continuously for ForDuration. While firing,
 //     further matching samples change nothing (no duplicate
-//     alerts); the first contradicting sample moves the alert to
-//     inactive and emits exactly one resolution.
+//     alerts). Contradicting samples start a recovery hold: only
+//     when they hold continuously for the rule's ResolveDuration
+//     is exactly one resolution emitted. A matching sample during
+//     the hold cancels it silently (back to plain firing).
+//
+// Cycles: every full trigger->recovery round increments a per
+// rule-revision+series cycle counter. The cycle is stamped onto the alert
+// state so notifications of different rounds are distinguishable and each
+// round gets its own exactly-once firing/recovery pair.
 //
 // Rule revisions carry a Version: states from an outdated version are
 // isolated from the new definition.
@@ -20,6 +27,7 @@ package engine
 import (
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +44,10 @@ type Engine struct {
 	mu     sync.Mutex
 	rules  map[string]model.Rule
 	states map[string]*model.AlertState
+	// cycles remembers the last cycle number per state key across
+	// recoveries, so a re-triggered series starts a new round instead of
+	// being mistaken for a duplicate of the first one.
+	cycles map[string]int
 }
 
 // New creates an empty engine.
@@ -43,6 +55,7 @@ func New() *Engine {
 	return &Engine{
 		rules:  make(map[string]model.Rule),
 		states: make(map[string]*model.AlertState),
+		cycles: make(map[string]int),
 	}
 }
 
@@ -55,7 +68,8 @@ func contentKey(r model.Rule) string {
 	sort.Strings(keys)
 	out := r.Metric + "|" + string(r.Operator) + "|" +
 		strconv.FormatFloat(r.Threshold, 'g', -1, 64) + "|" +
-		strconv.FormatInt(int64(r.ForDuration), 10) + "|"
+		strconv.FormatInt(int64(r.ForDuration), 10) + "|" +
+		strconv.FormatInt(int64(r.ResolveDuration), 10) + "|"
 	for _, k := range keys {
 		out += k + "=" + r.Match[k] + ","
 	}
@@ -105,6 +119,22 @@ func (e *Engine) SetRules(rules []model.Rule) (resolved []model.AlertState) {
 				resolved = append(resolved, final)
 			}
 			delete(e.states, sk)
+		}
+	}
+	// Cycle memories of outdated revisions are dropped so long-running
+	// config churn cannot grow the table without bound; the new revision
+	// starts its own round numbering at 1.
+	current := make(map[string]bool, len(next))
+	for _, r := range next {
+		current[r.VersionedKey()] = true
+	}
+	for ck := range e.cycles {
+		rulePart := ck
+		if i := strings.IndexByte(ck, '|'); i >= 0 {
+			rulePart = ck[:i]
+		}
+		if !current[rulePart] {
+			delete(e.cycles, ck)
 		}
 	}
 	sort.Slice(resolved, func(i, j int) bool {
@@ -166,6 +196,21 @@ func (e *Engine) Tick(now time.Time) []model.Event {
 			continue
 		}
 		if st.Status != model.StatusPending {
+			if st.Status == model.StatusFiring && !st.ResolveSince.IsZero() &&
+				!r.Evaluate(st.LastValue) && now.Sub(st.ResolveSince) >= r.ResolveDuration {
+				// Recovery hold elapsed while the condition kept failing:
+				// resolve exactly once, stamped with the finished cycle.
+				st.Status = model.StatusInactive
+				st.LastChangeAt = now
+				st.LastEvalTime = now
+				events = append(events, model.Event{
+					Type:  model.EventResolved,
+					Time:  now,
+					State: cloneState(st),
+				})
+				delete(e.states, k)
+				continue
+			}
 			st.LastEvalTime = now
 			continue
 		}
@@ -173,18 +218,24 @@ func (e *Engine) Tick(now time.Time) []model.Event {
 			continue
 		}
 		if now.Sub(st.ActiveSince) >= r.ForDuration {
-			st.Status = model.StatusFiring
-			st.LastChangeAt = now
 			st.LastEvalTime = now
 			st.FiredNotified = false
-			events = append(events, model.Event{
-				Type:  model.EventFiring,
-				Time:  now,
-				State: cloneState(st),
-			})
+			events = append(events, e.promoteToFiringLocked(k, st, now))
 		}
 	}
 	return events
+}
+
+// promoteToFiringLocked moves a pending state to firing and starts a new
+// round: the cycle counter is bumped here (not at pending time) so the
+// cycle number always identifies the n-th actual firing round of the
+// series. Caller holds e.mu.
+func (e *Engine) promoteToFiringLocked(k string, st *model.AlertState, now time.Time) model.Event {
+	e.cycles[k]++
+	st.Status = model.StatusFiring
+	st.Cycle = e.cycles[k]
+	st.LastChangeAt = now
+	return model.Event{Type: model.EventFiring, Time: now, State: cloneState(st)}
 }
 
 // evaluateLocked runs one transition rule. Caller holds e.mu.
@@ -215,18 +266,14 @@ func (e *Engine) evaluateLocked(
 		e.states[k] = st
 		events = append(events, model.Event{Type: model.EventPending, Time: now, State: cloneState(st)})
 		if r.ForDuration <= 0 {
-			st.Status = model.StatusFiring
-			st.LastChangeAt = now
-			events = append(events, model.Event{Type: model.EventFiring, Time: now, State: cloneState(st)})
+			events = append(events, e.promoteToFiringLocked(k, st, now))
 		}
 
 	case st != nil && st.Status == model.StatusPending:
 		st.LastValue = value
 		st.LastEvalTime = now
 		if cond && now.Sub(st.ActiveSince) >= r.ForDuration {
-			st.Status = model.StatusFiring
-			st.LastChangeAt = now
-			events = append(events, model.Event{Type: model.EventFiring, Time: now, State: cloneState(st)})
+			events = append(events, e.promoteToFiringLocked(k, st, now))
 		} else if !cond {
 			// Flapping protection: contradicting evidence restarts the wait.
 			delete(e.states, k)
@@ -235,12 +282,26 @@ func (e *Engine) evaluateLocked(
 	case st != nil && st.Status == model.StatusFiring:
 		st.LastValue = value
 		st.LastEvalTime = now
-		if !cond {
-			st.Status = model.StatusInactive
-			st.LastChangeAt = now
-			events = append(events, model.Event{Type: model.EventResolved, Time: now, State: cloneState(st)})
-			delete(e.states, k)
+		if cond {
+			// Condition holds again: any ongoing recovery hold is
+			// cancelled silently, no resolution is produced.
+			st.ResolveSince = time.Time{}
+			break
 		}
+		if r.ResolveDuration > 0 {
+			// Recovery-side flapping protection: contradictions must hold
+			// continuously for ResolveDuration before resolving.
+			if st.ResolveSince.IsZero() {
+				st.ResolveSince = now
+			}
+			if now.Sub(st.ResolveSince) < r.ResolveDuration {
+				break
+			}
+		}
+		st.Status = model.StatusInactive
+		st.LastChangeAt = now
+		events = append(events, model.Event{Type: model.EventResolved, Time: now, State: cloneState(st)})
+		delete(e.states, k)
 		// cond == true: repeated reports while firing are a no-op.
 	}
 	return events
@@ -272,11 +333,12 @@ func (e *Engine) States() []model.AlertState {
 	return out
 }
 
-// Reset clears all alert states.
+// Reset clears all alert states and cycle memories.
 func (e *Engine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.states = make(map[string]*model.AlertState)
+	e.cycles = make(map[string]int)
 }
 
 // Compare compares a value against a threshold; exported for reuse/tests.

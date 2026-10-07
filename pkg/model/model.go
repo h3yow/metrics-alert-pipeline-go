@@ -218,14 +218,21 @@ const (
 
 // Rule is an alerting rule. Version marks rule revisions; judgments made
 // under an old version never silently merge into a new one.
+//
+// ForDuration guards the trigger side (condition must hold continuously);
+// ResolveDuration independently guards the recovery side (contradicting
+// evidence must hold continuously). The two durations never influence each
+// other. ResolveDuration <= 0 keeps the legacy behavior: the first
+// contradicting sample resolves immediately.
 type Rule struct {
-	ID          string
-	Metric      string
-	Match       map[string]string
-	Operator    Operator
-	Threshold   float64
-	ForDuration time.Duration
-	Version     int
+	ID              string
+	Metric          string
+	Match           map[string]string
+	Operator        Operator
+	Threshold       float64
+	ForDuration     time.Duration
+	ResolveDuration time.Duration
+	Version         int
 }
 
 // Key is the stable identity of the rule definition (without version).
@@ -256,6 +263,9 @@ func (r Rule) Validate() error {
 	}
 	if r.ForDuration < 0 {
 		return fmt.Errorf("rule %s has negative for duration", r.ID)
+	}
+	if r.ResolveDuration < 0 {
+		return fmt.Errorf("rule %s has negative resolve duration", r.ID)
 	}
 	return nil
 }
@@ -314,6 +324,15 @@ func (s Silence) Validate() error {
 }
 
 // AlertState is the current state of one rule/series pair.
+//
+// Cycle numbers the trigger/recovery rounds of one rule revision + series:
+// the first firing is cycle 1, and every re-trigger after a full recovery
+// starts the next cycle. Notifications carry the cycle so rounds are
+// distinguishable and de-duplicated per round.
+//
+// ResolveSince is non-zero only while a firing alert is in its recovery
+// hold: contradicting evidence arrived but has not yet held continuously
+// for the rule's ResolveDuration.
 type AlertState struct {
 	AlertKey         string
 	RuleID           string
@@ -322,7 +341,9 @@ type AlertState struct {
 	Metric           string
 	Labels           Labels
 	Status           AlertStatus
+	Cycle            int
 	ActiveSince      time.Time
+	ResolveSince     time.Time
 	LastValue        float64
 	LastEvalTime     time.Time
 	LastChangeAt     time.Time

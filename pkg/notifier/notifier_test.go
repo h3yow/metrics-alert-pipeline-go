@@ -104,3 +104,128 @@ func TestConcurrentDispatchAtMostOnce(t *testing.T) {
 	}
 	t.Logf("input: 32 concurrent identical firing events; basis: exactly 1 delivery")
 }
+
+func cycleEvent(host string, cycle, t int) model.Event {
+	ev := firingEvent(host, t)
+	ev.State.Cycle = cycle
+	return ev
+}
+
+func TestDedupPerCycle(t *testing.T) {
+	s := &sink{}
+	n := New(RecorderFunc(s.Notify), nil)
+
+	// Round 1: firing + resolved; round 2 of the same series must not be
+	// swallowed by round 1's dedup memory.
+	for cycle := 1; cycle <= 2; cycle++ {
+		if e := n.Dispatch(cycleEvent("a", cycle, cycle*10)); e.Type != model.EventNotified {
+			t.Fatalf("cycle %d firing must notify, got %s", cycle, e.Type)
+		}
+		rev := cycleEvent("a", cycle, cycle*10+5)
+		rev.Type = model.EventResolved
+		if e := n.Dispatch(rev); e.Type != model.EventNotified {
+			t.Fatalf("cycle %d recovery must notify, got %s", cycle, e.Type)
+		}
+	}
+	// Re-dispatch of an old round is still a duplicate.
+	if e := n.Dispatch(cycleEvent("a", 1, 99)); e.Type != model.EventSuppressed {
+		t.Fatalf("re-dispatched cycle-1 firing must stay duplicate, got %s", e.Type)
+	}
+	if len(s.got) != 4 {
+		t.Fatalf("want 4 deliveries (2 rounds x firing+recovery), got %d", len(s.got))
+	}
+	t.Logf("basis: dedup identity includes the round number; rounds 1 and 2 each " +
+		"delivered firing+recovery exactly once, old-round re-dispatch suppressed")
+}
+
+type windowSilencer struct{ sil model.Silence }
+
+func (w windowSilencer) Match(metric string, ls model.Labels, t time.Time) *model.Silence {
+	if w.sil.Contains(t) && w.sil.Matches(metric, ls) {
+		return &w.sil
+	}
+	return nil
+}
+
+func TestSilenceDoesNotConsumeCycleSlot(t *testing.T) {
+	s := &sink{}
+	sil := windowSilencer{sil: model.Silence{
+		ID: "night", Metric: "cpu.usage",
+		Match:    map[string]string{"host": "a"},
+		StartsAt: time.Unix(0, 0), EndsAt: time.Unix(100, 0),
+	}}
+	n := New(RecorderFunc(s.Notify), sil)
+
+	// Round 1 fires inside the silence window: suppressed, no slot consumed.
+	if e := n.Dispatch(cycleEvent("a", 1, 10)); e.Type != model.EventSuppressed || e.SilenceID != "night" {
+		t.Fatalf("silenced firing must be suppressed, got %s/%s", e.Type, e.SilenceID)
+	}
+	// Round 2 fires after the window: delivered normally.
+	if e := n.Dispatch(cycleEvent("a", 2, 200)); e.Type != model.EventNotified {
+		t.Fatalf("post-silence round must notify, got %s", e.Type)
+	}
+	// And because silence consumed nothing, even a late re-dispatch of
+	// round 1 (after the window) is delivered rather than deduped.
+	if e := n.Dispatch(cycleEvent("a", 1, 300)); e.Type != model.EventNotified {
+		t.Fatalf("silence must not consume the round-1 slot, got %s", e.Type)
+	}
+	if len(s.got) != 2 {
+		t.Fatalf("want 2 deliveries, got %d", len(s.got))
+	}
+	t.Logf("basis: silence only drops the notification; round numbering, state and " +
+		"later rounds are unaffected, and no dedup slot is consumed")
+}
+
+func TestDedupMemoryBounded(t *testing.T) {
+	s := &sink{}
+	n := NewWithOptions(RecorderFunc(s.Notify), nil, Options{RetainCycles: 3})
+
+	// Rounds 1..10 fire and resolve; each round must deliver exactly once.
+	for cycle := 1; cycle <= 10; cycle++ {
+		if e := n.Dispatch(cycleEvent("a", cycle, cycle*10)); e.Type != model.EventNotified {
+			t.Fatalf("cycle %d must notify, got %s", cycle, e.Type)
+		}
+	}
+	if len(s.got) != 10 {
+		t.Fatalf("want 10 deliveries, got %d", len(s.got))
+	}
+	// Memory is bounded to the 3 most recent rounds.
+	fired, _ := n.Delivered()
+	if len(fired) != 3 {
+		t.Fatalf("dedup memory must keep only 3 rounds, keeps %d: %v", len(fired), fired)
+	}
+	// A round inside the window is still deduped exactly.
+	if e := n.Dispatch(cycleEvent("a", 10, 999)); e.Type != model.EventSuppressed {
+		t.Fatalf("recent round re-dispatch must be duplicate, got %s", e.Type)
+	}
+	// An evicted old round is not mistaken for a new one (no re-delivery).
+	if e := n.Dispatch(cycleEvent("a", 1, 1000)); e.Type != model.EventSuppressed {
+		t.Fatalf("evicted round must not be re-delivered, got %s", e.Type)
+	}
+	if len(s.got) != 10 {
+		t.Fatalf("evicted/duplicate rounds must not add deliveries, got %d", len(s.got))
+	}
+	t.Logf("basis: retain=3 keeps rounds 8..10; evicted rounds suppress as old, " +
+		"never suppress newer rounds, memory stays bounded")
+}
+
+func TestConcurrentDispatchPerCycleAtMostOnce(t *testing.T) {
+	s := &sink{}
+	n := New(RecorderFunc(s.Notify), nil)
+	var wg sync.WaitGroup
+	// 16 goroutines x the same 5 rounds: each round delivered exactly once.
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for cycle := 1; cycle <= 5; cycle++ {
+				n.Dispatch(cycleEvent("a", cycle, cycle))
+			}
+		}()
+	}
+	wg.Wait()
+	if len(s.got) != 5 {
+		t.Fatalf("concurrent dispatch of 5 rounds delivered %d, want 5", len(s.got))
+	}
+	t.Logf("input: 16 goroutines x 5 identical rounds; basis: exactly 1 delivery per round")
+}

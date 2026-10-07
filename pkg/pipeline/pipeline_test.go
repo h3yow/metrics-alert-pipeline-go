@@ -187,3 +187,166 @@ func TestReplayReproducesAfterSilenceChange(t *testing.T) {
 	t.Logf("basis: replay with new silences -> suppressed %d -> %d, notified %d -> %d",
 		before.Suppressed, after.Suppressed, before.Notified, after.Notified)
 }
+
+// evSink records full events for cycle-aware assertions.
+type evSink struct {
+	mu  sync.Mutex
+	evs []model.Event
+}
+
+func (s *evSink) Notify(ev model.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evs = append(s.evs, ev)
+}
+
+func (s *evSink) delivered() []model.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.Event(nil), s.evs...)
+}
+
+func ruleWithResolve() model.Rule {
+	r := rule()
+	r.ResolveDuration = 10 * time.Second
+	return r
+}
+
+// multiCycleSet drives host a through three full trigger/recovery rounds:
+// round 1 notified, round 2 firing silenced (window [40,60)), round 3
+// notified again. Round 1's recovery includes a glitch back to satisfied.
+func multiCycleSet() []model.Sample {
+	return []model.Sample{
+		// round 1
+		s1("cpu.usage", "a", "node-a", 95, 1),  // pending
+		s1("cpu.usage", "a", "node-a", 96, 16), // firing c1 (held 15s)
+		s1("cpu.usage", "a", "node-a", 50, 20), // recovery hold starts
+		s1("cpu.usage", "a", "node-a", 99, 23), // glitch: hold cancelled, still firing
+		s1("cpu.usage", "a", "node-a", 50, 25), // hold restarts
+		s1("cpu.usage", "a", "node-a", 50, 35), // resolved c1 (held 10s)
+		// round 2, firing falls into silence window [40,60)
+		s1("cpu.usage", "a", "node-a", 95, 41), // pending
+		s1("cpu.usage", "a", "node-a", 96, 56), // firing c2 (silenced)
+		s1("cpu.usage", "a", "node-a", 40, 62), // hold starts (window over)
+		s1("cpu.usage", "a", "node-a", 40, 72), // resolved c2
+		// round 3
+		s1("cpu.usage", "a", "node-a", 95, 80),  // pending
+		s1("cpu.usage", "a", "node-a", 96, 95),  // firing c3
+		s1("cpu.usage", "a", "node-a", 40, 100), // hold starts
+		s1("cpu.usage", "a", "node-a", 40, 110), // resolved c3
+	}
+}
+
+func newMultiCyclePipeline(sink *evSink) *Pipeline {
+	p := New(Config{WindowSize: 10 * time.Second}, sink)
+	p.SetRules([]model.Rule{ruleWithResolve()})
+	p.SetSilences([]model.Silence{{
+		ID: "maint", Metric: "cpu.usage", Match: map[string]string{"host": "a"},
+		StartsAt: at(40), EndsAt: at(60),
+	}})
+	return p
+}
+
+func TestMultiCycleNotificationsExactlyOncePerRound(t *testing.T) {
+	sink := &evSink{}
+	p := newMultiCyclePipeline(sink)
+	for _, s := range multiCycleSet() {
+		evs := p.Ingest(s)
+		for _, ev := range evs {
+			cyc := 0
+			if ev.State != nil {
+				cyc = ev.State.Cycle
+			}
+			t.Logf("input v=%.0f ts=%s -> event=%s cycle=%d detail=%q",
+				s.Value, s.Timestamp.Format("15:04:05"), ev.Type, cyc, ev.Detail)
+		}
+	}
+
+	st := p.Stats()
+	if st.Firing != 3 || st.Resolved != 3 {
+		t.Fatalf("3 rounds must produce 3 firing + 3 resolved transitions, got %+v", st)
+	}
+	// Round 2's firing is silenced: 5 notified, 1 suppressed. Silence must
+	// not eat round 3's notifications.
+	if st.Notified != 5 || st.Suppressed != 1 {
+		t.Fatalf("want notified=5 suppressed=1, got %+v", st)
+	}
+	// Every delivered notification carries its round number; each round
+	// contributes exactly one firing and/or one recovery.
+	type key struct {
+		typ   model.EventType
+		cycle int
+	}
+	counts := map[key]int{}
+	for _, ev := range sink.delivered() {
+		counts[key{ev.Type, ev.State.Cycle}]++
+	}
+	want := map[key]int{
+		{model.EventFiring, 1}: 1, {model.EventResolved, 1}: 1,
+		{model.EventResolved, 2}: 1, // round-2 firing was silenced
+		{model.EventFiring, 3}:   1, {model.EventResolved, 3}: 1,
+	}
+	for k, w := range want {
+		if counts[k] != w {
+			t.Fatalf("delivered %v = %d, want %d (all=%v)", k, counts[k], w, counts)
+		}
+	}
+	t.Logf("basis: 3 rounds x (firing+recovery) with round-2 firing silenced -> " +
+		"notified=5 suppressed=1, per-round exactly-once holds")
+}
+
+func TestMultiCycleConcurrentEqualsSerial(t *testing.T) {
+	set := multiCycleSet()
+
+	ser := newMultiCyclePipeline(&evSink{})
+	for _, s := range set {
+		ser.Ingest(s)
+	}
+
+	conc := newMultiCyclePipeline(&evSink{})
+	var wg sync.WaitGroup
+	for _, s := range set {
+		wg.Add(1)
+		go func(s model.Sample) { defer wg.Done(); conc.Ingest(s) }(s)
+	}
+	wg.Wait()
+
+	e1, st1, _, states1 := ser.Replay()
+	e2, st2, _, states2 := conc.Replay()
+	if st1 != st2 || len(e1) != len(e2) || fmt.Sprint(states1) != fmt.Sprint(states2) {
+		t.Fatalf("concurrent and serial replay diverged:\nserial=%+v (%d events)\nconc=%+v (%d events)",
+			st1, len(e1), st2, len(e2))
+	}
+	// Replay conclusions must also match the live serial run.
+	live := ser.Stats()
+	if st1.Firing != live.Firing || st1.Resolved != live.Resolved ||
+		st1.Notified != live.Notified || st1.Suppressed != live.Suppressed {
+		t.Fatalf("replay stats %+v must match live stats %+v", st1, live)
+	}
+	t.Logf("basis: replay sorted by (timestamp, identity); serial==concurrent==live: %+v", st1)
+}
+
+func TestMultiCycleDedupRetentionBounded(t *testing.T) {
+	sink := &evSink{}
+	p := New(Config{WindowSize: 10 * time.Second, DedupRetainCycles: 2}, sink)
+	p.SetRules([]model.Rule{ruleWithResolve()})
+
+	// 6 rapid rounds on the same series.
+	for round := 0; round < 6; round++ {
+		b := round * 100
+		for _, s := range []model.Sample{
+			s1("cpu.usage", "a", "node-a", 95, b+1),  // pending
+			s1("cpu.usage", "a", "node-a", 96, b+16), // firing
+			s1("cpu.usage", "a", "node-a", 40, b+20), // hold
+			s1("cpu.usage", "a", "node-a", 40, b+30), // resolved
+		} {
+			p.Ingest(s)
+		}
+	}
+	st := p.Stats()
+	if st.Firing != 6 || st.Resolved != 6 || st.Notified != 12 {
+		t.Fatalf("6 rounds must notify 12 times even with retain=2, got %+v", st)
+	}
+	t.Logf("basis: dedup retention=2 rounds bounds memory but every one of the "+
+		"6 rounds still notified firing+recovery exactly once: %+v", st)
+}
