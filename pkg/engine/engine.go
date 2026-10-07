@@ -1,6 +1,6 @@
 // Package engine evaluates alert rules against samples and maintains the
-// inactive -> pending -> firing state machine with duration ("for") and
-// flapping protection.
+// inactive -> pending -> firing -> resolving state machine with duration
+// guards and flapping protection on both sides.
 //
 // State rules:
 //
@@ -10,14 +10,26 @@
 //     waiting timer (short flapping never alerts).
 //   - firing:   condition held continuously for ForDuration. While firing,
 //     further matching samples change nothing (no duplicate
-//     alerts); the first contradicting sample moves the alert to
-//     inactive and emits exactly one resolution.
+//     alerts). Recovery is guarded by ResolveDuration: a
+//     contradicting sample only starts the recovery wait.
+//   - resolving: contradicting evidence is accumulating. If the condition
+//     becomes true again the alert returns to firing as if the
+//     recovery never started (no notification). Only when the
+//     contradiction holds continuously for ResolveDuration is
+//     exactly one resolution emitted. ResolveDuration == 0
+//     resolves on the first contradicting sample.
+//
+// Each firing episode is a numbered cycle: the cycle number is assigned at
+// promotion to firing and carried by the firing and resolved events, so
+// repeated trigger/recover rounds of the same series are distinguishable
+// and de-duplicated per round instead of swallowing later rounds.
 //
 // Rule revisions carry a Version: states from an outdated version are
 // isolated from the new definition.
 package engine
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"sync"
@@ -36,6 +48,7 @@ type Engine struct {
 	mu     sync.Mutex
 	rules  map[string]model.Rule
 	states map[string]*model.AlertState
+	cycles map[string]int // last assigned cycle per stateKey
 }
 
 // New creates an empty engine.
@@ -43,6 +56,7 @@ func New() *Engine {
 	return &Engine{
 		rules:  make(map[string]model.Rule),
 		states: make(map[string]*model.AlertState),
+		cycles: make(map[string]int),
 	}
 }
 
@@ -55,7 +69,8 @@ func contentKey(r model.Rule) string {
 	sort.Strings(keys)
 	out := r.Metric + "|" + string(r.Operator) + "|" +
 		strconv.FormatFloat(r.Threshold, 'g', -1, 64) + "|" +
-		strconv.FormatInt(int64(r.ForDuration), 10) + "|"
+		strconv.FormatInt(int64(r.ForDuration), 10) + "|" +
+		strconv.FormatInt(int64(r.ResolveDuration), 10) + "|"
 	for _, k := range keys {
 		out += k + "=" + r.Match[k] + ","
 	}
@@ -99,12 +114,13 @@ func (e *Engine) SetRules(rules []model.Rule) (resolved []model.AlertState) {
 		if !ok || r.Version != st.RuleVersion {
 			// Rule removed or revised: an old firing is finalized exactly
 			// once before its state disappears.
-			if st.Status == model.StatusFiring {
+			if st.Status == model.StatusFiring || st.Status == model.StatusResolving {
 				final := *cloneState(st)
 				final.Status = model.StatusInactive
 				resolved = append(resolved, final)
 			}
 			delete(e.states, sk)
+			delete(e.cycles, sk)
 		}
 	}
 	sort.Slice(resolved, func(i, j int) bool {
@@ -148,7 +164,8 @@ func (e *Engine) Observe(s model.Sample, now time.Time) []model.Event {
 
 // Tick performs time-driven evaluation at now: pending alerts whose
 // condition is still satisfied by the last observed value and whose
-// ForDuration has elapsed are promoted to firing.
+// ForDuration has elapsed are promoted to firing; resolving alerts whose
+// contradiction has held for ResolveDuration are resolved.
 func (e *Engine) Tick(now time.Time) []model.Event {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -165,23 +182,30 @@ func (e *Engine) Tick(now time.Time) []model.Event {
 		if !ok || r.Version != st.RuleVersion {
 			continue
 		}
-		if st.Status != model.StatusPending {
+		switch st.Status {
+		case model.StatusPending:
 			st.LastEvalTime = now
-			continue
-		}
-		if !r.Evaluate(st.LastValue) {
-			continue
-		}
-		if now.Sub(st.ActiveSince) >= r.ForDuration {
-			st.Status = model.StatusFiring
-			st.LastChangeAt = now
+			if !r.Evaluate(st.LastValue) {
+				continue
+			}
+			if now.Sub(st.ActiveSince) >= r.ForDuration {
+				events = append(events, e.promoteLocked(k, st, r, now))
+			}
+		case model.StatusResolving:
 			st.LastEvalTime = now
-			st.FiredNotified = false
-			events = append(events, model.Event{
-				Type:  model.EventFiring,
-				Time:  now,
-				State: cloneState(st),
-			})
+			if r.Evaluate(st.LastValue) {
+				// Last known value satisfies again: the pending recovery
+				// is cancelled as if it never started.
+				st.Status = model.StatusFiring
+				st.ResolveSince = time.Time{}
+				st.LastChangeAt = now
+				continue
+			}
+			if now.Sub(st.ResolveSince) >= r.ResolveDuration {
+				events = append(events, e.resolveLocked(k, st, r, now))
+			}
+		default:
+			st.LastEvalTime = now
 		}
 	}
 	return events
@@ -213,20 +237,20 @@ func (e *Engine) evaluateLocked(
 			LastChangeAt: now,
 		}
 		e.states[k] = st
-		events = append(events, model.Event{Type: model.EventPending, Time: now, State: cloneState(st)})
+		events = append(events, model.Event{
+			Type: model.EventPending, Time: now, State: cloneState(st),
+			Detail: fmt.Sprintf("condition true (%.4g %s %.4g), waiting for %s",
+				value, r.Operator, r.Threshold, r.ForDuration),
+		})
 		if r.ForDuration <= 0 {
-			st.Status = model.StatusFiring
-			st.LastChangeAt = now
-			events = append(events, model.Event{Type: model.EventFiring, Time: now, State: cloneState(st)})
+			events = append(events, e.promoteLocked(k, st, r, now))
 		}
 
 	case st != nil && st.Status == model.StatusPending:
 		st.LastValue = value
 		st.LastEvalTime = now
 		if cond && now.Sub(st.ActiveSince) >= r.ForDuration {
-			st.Status = model.StatusFiring
-			st.LastChangeAt = now
-			events = append(events, model.Event{Type: model.EventFiring, Time: now, State: cloneState(st)})
+			events = append(events, e.promoteLocked(k, st, r, now))
 		} else if !cond {
 			// Flapping protection: contradicting evidence restarts the wait.
 			delete(e.states, k)
@@ -236,14 +260,73 @@ func (e *Engine) evaluateLocked(
 		st.LastValue = value
 		st.LastEvalTime = now
 		if !cond {
-			st.Status = model.StatusInactive
-			st.LastChangeAt = now
-			events = append(events, model.Event{Type: model.EventResolved, Time: now, State: cloneState(st)})
-			delete(e.states, k)
+			if r.ResolveDuration <= 0 {
+				events = append(events, e.resolveLocked(k, st, r, now))
+			} else {
+				// Recovery needs sustained contradicting evidence too:
+				// a single counter-example only starts the wait.
+				st.Status = model.StatusResolving
+				st.ResolveSince = now
+				st.LastChangeAt = now
+				events = append(events, model.Event{
+					Type: model.EventResolving, Time: now, State: cloneState(st),
+					Detail: fmt.Sprintf("cycle %d: value %.4g violates %s %.4g, recovery waits %s",
+						st.Cycle, value, r.Operator, r.Threshold, r.ResolveDuration),
+				})
+			}
 		}
 		// cond == true: repeated reports while firing are a no-op.
+
+	case st != nil && st.Status == model.StatusResolving:
+		st.LastValue = value
+		st.LastEvalTime = now
+		if cond {
+			// Flap back to satisfied: the pending recovery is cancelled,
+			// no resolution is or will be emitted for this episode.
+			st.Status = model.StatusFiring
+			st.ResolveSince = time.Time{}
+			st.LastChangeAt = now
+		} else if now.Sub(st.ResolveSince) >= r.ResolveDuration {
+			events = append(events, e.resolveLocked(k, st, r, now))
+		}
 	}
 	return events
+}
+
+// promoteLocked assigns the next cycle number and moves the alert to
+// firing. Caller holds e.mu.
+func (e *Engine) promoteLocked(k string, st *model.AlertState, r model.Rule, now time.Time) model.Event {
+	e.cycles[k]++
+	st.Cycle = e.cycles[k]
+	st.Status = model.StatusFiring
+	st.LastChangeAt = now
+	st.LastEvalTime = now
+	st.FiredNotified = false
+	return model.Event{
+		Type: model.EventFiring, Time: now, State: cloneState(st),
+		Detail: fmt.Sprintf("cycle %d: condition held %s >= for %s",
+			st.Cycle, now.Sub(st.ActiveSince).Round(time.Millisecond), r.ForDuration),
+	}
+}
+
+// resolveLocked emits the single resolution of the current cycle and drops
+// the state; the next satisfied sample starts a fresh cycle. Caller holds
+// e.mu.
+func (e *Engine) resolveLocked(k string, st *model.AlertState, r model.Rule, now time.Time) model.Event {
+	held := "first contradicting sample"
+	if !st.ResolveSince.IsZero() {
+		held = fmt.Sprintf("condition false held %s >= resolve_for %s",
+			now.Sub(st.ResolveSince).Round(time.Millisecond), r.ResolveDuration)
+	}
+	st.Status = model.StatusInactive
+	st.LastChangeAt = now
+	st.LastEvalTime = now
+	ev := model.Event{
+		Type: model.EventResolved, Time: now, State: cloneState(st),
+		Detail: fmt.Sprintf("cycle %d: %s", st.Cycle, held),
+	}
+	delete(e.states, k)
+	return ev
 }
 
 func (e *Engine) sortedRulesLocked() []model.Rule {
@@ -272,11 +355,12 @@ func (e *Engine) States() []model.AlertState {
 	return out
 }
 
-// Reset clears all alert states.
+// Reset clears all alert states and cycle counters.
 func (e *Engine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.states = make(map[string]*model.AlertState)
+	e.cycles = make(map[string]int)
 }
 
 // Compare compares a value against a threshold; exported for reuse/tests.

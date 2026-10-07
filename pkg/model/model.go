@@ -199,9 +199,10 @@ type Aggregate struct {
 type AlertStatus string
 
 const (
-	StatusInactive AlertStatus = "inactive"
-	StatusPending  AlertStatus = "pending"
-	StatusFiring   AlertStatus = "firing"
+	StatusInactive  AlertStatus = "inactive"
+	StatusPending   AlertStatus = "pending"
+	StatusFiring    AlertStatus = "firing"
+	StatusResolving AlertStatus = "resolving"
 )
 
 // Operator is a threshold comparison operator.
@@ -218,14 +219,22 @@ const (
 
 // Rule is an alerting rule. Version marks rule revisions; judgments made
 // under an old version never silently merge into a new one.
+//
+// ForDuration guards triggering: the condition must hold continuously for
+// that long before firing. ResolveDuration independently guards recovery:
+// contradicting evidence must hold continuously for that long before the
+// alert resolves; a single satisfied sample in between cancels the pending
+// recovery. ResolveDuration == 0 resolves on the first contradicting sample
+// (the historical single-cycle behavior).
 type Rule struct {
-	ID          string
-	Metric      string
-	Match       map[string]string
-	Operator    Operator
-	Threshold   float64
-	ForDuration time.Duration
-	Version     int
+	ID              string
+	Metric          string
+	Match           map[string]string
+	Operator        Operator
+	Threshold       float64
+	ForDuration     time.Duration
+	ResolveDuration time.Duration
+	Version         int
 }
 
 // Key is the stable identity of the rule definition (without version).
@@ -256,6 +265,9 @@ func (r Rule) Validate() error {
 	}
 	if r.ForDuration < 0 {
 		return fmt.Errorf("rule %s has negative for duration", r.ID)
+	}
+	if r.ResolveDuration < 0 {
+		return fmt.Errorf("rule %s has negative resolve duration", r.ID)
 	}
 	return nil
 }
@@ -314,6 +326,11 @@ func (s Silence) Validate() error {
 }
 
 // AlertState is the current state of one rule/series pair.
+//
+// Cycle identifies the trigger round: it is assigned when the alert enters
+// firing and stays attached through resolving/resolved, so every firing and
+// recovery notification carries the round it belongs to. The same series
+// firing again after a recovery starts a new cycle with the next number.
 type AlertState struct {
 	AlertKey         string
 	RuleID           string
@@ -322,7 +339,9 @@ type AlertState struct {
 	Metric           string
 	Labels           Labels
 	Status           AlertStatus
+	Cycle            int
 	ActiveSince      time.Time
+	ResolveSince     time.Time
 	LastValue        float64
 	LastEvalTime     time.Time
 	LastChangeAt     time.Time
@@ -339,6 +358,7 @@ const (
 	EventDuplicate  EventType = "sample_duplicate"
 	EventPending    EventType = "alert_pending"
 	EventFiring     EventType = "alert_firing"
+	EventResolving  EventType = "alert_resolving"
 	EventResolved   EventType = "alert_resolved"
 	EventSuppressed EventType = "notification_suppressed"
 	EventNotified   EventType = "notification_sent"

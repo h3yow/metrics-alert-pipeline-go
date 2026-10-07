@@ -10,11 +10,11 @@
 | `pkg/model` | 样本、标签、聚合结果、规则、静默、状态、事件等核心类型与校验 |
 | `pkg/collector` | 采集入口：非法样本拒绝（可区分原因）、来源标签归并、重复识别 |
 | `pkg/aggregator` | 并发安全的定长窗口聚合；乱序样本统一口径合并；幂等累加 |
-| `pkg/engine` | 告警状态机 `inactive → pending → firing`，持续时间与抖动保护 |
+| `pkg/engine` | 告警状态机 `inactive → pending → firing → resolving`，触发/恢复双侧持续时间与抖动保护，多轮 cycle 编号 |
 | `pkg/silence` | 按时间窗 + 标签匹配的静默配置 |
-| `pkg/notifier` | 通知去重（稳定标识）与静默抑制 |
+| `pkg/notifier` | 按轮次作用域的通知去重（有界记忆）与静默抑制 |
 | `pkg/pipeline` | 全链路编排、事件/统计、基于历史的确定性 Replay |
-| `cmd/demo` | 本地可运行演示：并发/乱序/非法/抖动/静默/规则变更 |
+| `cmd/demo` | 本地可运行演示：并发/乱序/非法/抖动/多轮触发恢复/恢复抖动/静默/规则变更 |
 
 ## 快速开始
 
@@ -74,48 +74,77 @@ go test -race -count=10 ./pkg/pipeline   # 并发==串行的稳定性复跑
    inactive ───────────────────────▶ pending ──────────────▶ firing
       ▲                                  │                      │
       │                                  │ 条件为假(任意时刻)    │ 条件为假(首个反例)
-      └──────────────────────────────────┘                      ▼
-                                      (计时清零，回到 inactive，无状态/无事件)  resolved(恰好一次) → inactive
+      │                                  │ (计时清零，无事件)    ▼
+      │                                  └────────────────── resolving
+      │                                                        │        │
+      │            resolved(恰好一次)                           │        │ 又变回满足
+      └──────────────────────────────────────────◀─────────────┘        │ (当作没恢复过，
+         反例连续保持 >= resolve_for                                     ▼  回到 firing，无事件)
 ```
 
-- **抖动保护**：pending 期间收到任意反例，立即回到 inactive 并清空等待计时；
+- **触发侧抖动保护**：pending 期间收到任意反例，立即回到 inactive 并清空等待计时；
   短时抖动永远不会触发。再次为真时重新计时。
+- **恢复侧持续时间与抖动保护**：firing 期间收到反例不会立刻恢复，而是进入
+  `resolving` 并开始恢复计时；反例必须**连续保持 `resolve_for`** 才发出恢复。
+  中间只要又变回满足，立即回到 firing，当作没恢复过，不产生任何通知；
+  之后的反例重新计时。`resolve_for` 由 `Rule.ResolveDuration` 单独配置，
+  与触发侧 `ForDuration` 互不影响；`resolve_for=0` 保持旧行为（首个反例立即恢复）。
 - **持续时间**：`for=0` 表示当 tick/样本时刻立即触发；否则按样本时间戳在
-  每个时间点「先 tick（用截至此刻最新值做提升）再处理样本」推进。
-- **触发期重复上报无副作用**：firing 中条件持续为真的样本是 no-op，不会重复告警；
-  收到第一个反例时转为 inactive 且**恢复通知恰好一次**。
+  每个时间点「先 tick（用截至此刻最新值做提升/恢复判定）再处理样本」推进。
+- **触发期重复上报无副作用**：firing 中条件持续为真的样本是 no-op，不会重复告警。
 - 判定时刻使用**样本时间戳**而非墙上时钟，因此离线 Replay 与在线处理口径一致。
+- 每个状态迁移事件都带 `Detail`，说明判定依据（如
+  `cycle 2: condition held 11s >= for 10s`、`cycle 1: value 50 violates > 90, recovery waits 10s`），
+  单测日志可直接看到每个输入样本为什么触发/恢复/不恢复。
+
+### 多轮触发恢复（cycle）
+
+- 每一次「pending → firing → resolved」称为一轮（cycle）。轮次号在进入 firing 时分配，
+  从 1 开始单调递增，并随 firing / resolving / resolved 事件与通知一起携带
+  （`AlertState.Cycle`），因此能看出每条通知属于第几轮。
+- 同一序列恢复后再次持续满足条件，会像第一次一样完整走一遍触发流程，
+  轮次号 +1；**每一轮触发通知与恢复通知各自恰好一次**。
+- 同一轮内的重复上报、并发重复上报仍只投递一次（去重按轮次作用域，见第 4 节）；
+  不同轮次互不顶掉。
+- pending 阶段被抖动清零不消耗轮次号（没进入 firing 就不算一轮）。
 
 ### 规则版本（配置变更可复现）
 
-- 规则定义指纹包含 `metric / operator / threshold / for / match`；定义不变保留版本号，
-  任何变化产生新版本 `#vN`。
-- 规则修改/删除时，旧版本的 firing 状态会被终结为 inactive 并恰好产出一次恢复，
-  新旧版本状态严格隔离，绝不把旧判定并入新规则。
+- 规则定义指纹包含 `metric / operator / threshold / for / resolve_for / match`；
+  定义不变保留版本号，任何变化产生新版本 `#vN`。
+- 规则修改/删除时，旧版本的 firing/resolving 状态会被终结为 inactive 并恰好产出一次恢复，
+  新旧版本状态严格隔离，绝不把旧判定并入新规则；新版本的轮次号从 1 重新计。
 
 ## 4. 静默与去重语义
 
 ### 静默（Silence）
 
 - 半开窗口 `[StartsAt, EndsAt)` + metric/标签选择器，按 ID 取第一个命中。
-- **只抑制通知，不改变状态与统计**：firing/pending 照常发生、统计计数照常累加，
-  仅 notifier 把该次通知改写为 `notification_suppressed` 事件。
-- 静默会「占用」该周期的 firing 通知槽（窗口结束后不会补发旧告警），但未来的恢复
-  通知不受影响，保证恢复不漏。
+- **只抑制通知，不改变状态、轮次与统计**：firing/pending/resolving 照常发生、
+  轮次照常推进、统计计数照常累加，仅 notifier 把该次通知改写为
+  `notification_suppressed` 事件。
+- 静默只「占用」**本轮**的 firing 通知槽（窗口结束后不会补发这一轮旧的 firing），
+  **不影响后续轮次**：窗口结束后，下一轮触发/恢复照常通知；本轮的恢复通知若落在
+  窗口外也照常投递，保证恢复不漏。
 
 ### 去重（Dedup）
 
-- 稳定标识 `AlertKey = ruleID#version + "|" + SeriesKey`，firing 与 resolved
-  各自独立占槽，每周期最多各投递一次。
+- 稳定标识 `AlertKey = ruleID#version + "|" + SeriesKey`，再叠加轮次号：
+  去重槽位为 `(AlertKey, cycle, firing|resolved)`，每轮每类最多投递一次。
 - notifier 是状态机幂等之外的第二道保险；32 个 goroutine 并发投递同一 firing，
   实际下发恰好 1 次。
+- **容量有上界**：每个 AlertKey 只保留最近 `DedupRounds` 轮的去重记忆
+  （`pipeline.Config.DedupRounds`，默认 64；`notifier.WithMaxRounds` 可单独配置）。
+  轮次号单调递增，淘汰只移除严格更旧的轮次，因此被淘汰的旧轮次不会误伤新轮次；
+  保留窗口内每轮仍然恰好一次。代价是：已被淘汰的旧轮次若再次上报，会被当作新通知
+  再投递一次（有界记忆的既定取舍）。`Notifier.MemoryEntries()` 可观测当前保留的槽位数。
 
 ## 5. 历史判定复现（Replay）
 
 `Pipeline.Replay()` 使用**当前规则与静默**，对全部已接受样本：
 
 1. 按 `(timestamp, identity)` 稳定排序（消除到达顺序/并发交错）；
-2. 在每个时间点先 `engine.Tick(ts)` 再 `Observe(sample, ts)`（确定性持续时间判定）；
+2. 在每个时间点先 `engine.Tick(ts)` 再 `Observe(sample, ts)`（确定性的触发提升与恢复判定）；
 3. 用全新的聚合器、状态机、通知器重放，返回事件流、统计、聚合快照与最终状态。
 
 因此：
@@ -134,11 +163,31 @@ go test -race -count=10 ./...
 |---|---|
 | `TestConcurrentSubmitNoLossNoDoubleCount` | 并发采集不丢不重，拒绝原因可区分 |
 | `TestOutOfOrderMergeUniform` / `TestConcurrentEqualsSerial` | 乱序合并口径、并发结果==串行、幂等 |
-| `TestPendingFlapNeverFires` / `TestFiresAndResolvesExactlyOnce` | 抖动保护、for 时长、触发期重复无副作用、恢复恰好一次 |
+| `TestPendingFlapNeverFires` / `TestFiresAndResolvesExactlyOnce` | 触发侧抖动保护、for 时长、触发期重复无副作用、恢复恰好一次 |
+| `TestMultiCycleTriggerResolve` | 多轮触发恢复：每轮 firing/resolved 各恰好一次，轮次号递增（含 Tick 提升） |
+| `TestResolveFlapDoesNotRecover` / `TestResolveDurationIndependentOfFor` / `TestTickDrivenResolution` | 恢复侧抖动不误恢复、恢复时长独立生效、Tick 驱动恢复 |
+| `TestResolveZeroKeepsImmediateRecovery` | `resolve_for=0` 保持旧的立即恢复行为 |
 | `TestRuleChangeIsolatesState` | 规则版本隔离与旧 firing 单次恢复 |
 | `TestDedupStableKey` / `TestSilenceSuppressesOnly` / `TestConcurrentDispatchAtMostOnce` | 稳定标识去重、静默只抑制、并发仅投递一次 |
-| `TestConcurrentIngestEqualsSerialViaReplay` | 并发 vs 串行：聚合/计数/Replay 结论一致 |
+| `TestMultiCycleDedup` / `TestDedupMemoryBounded` / `TestSilenceDoesNotBlockNextCycle` | 多轮各自恰好一次、去重记忆上界与淘汰不误伤新轮、静默不阻塞后续轮次 |
+| `TestMultiRoundNotificationsExactlyOnce` / `TestRecoveryFlapDoesNotNotify` / `TestSilenceAcrossRounds` | 全链路多轮通知次数、恢复抖动不刷屏、静默跨轮次 |
+| `TestConcurrentIngestEqualsSerialViaReplay` / `TestConcurrentMultiRoundEqualsSerial` | 并发 vs 串行：聚合/计数/Replay 结论一致（含多轮+恢复抖动+静默场景） |
 | `TestReplayReproducesAfterSilenceChange` | 静默变更后历史判定可复现，在线状态不变 |
 
 所有单测均通过 `t.Logf` 打印**输入样本**（metric/source/value/timestamp/labels）与
-**判定依据**（拒绝原因、first/last 口径、状态迁移条件、排序与槽位规则）。
+**判定依据**（拒绝原因、first/last 口径、状态迁移条件、轮次号、排序与槽位规则）。
+
+## 7. 与旧版结论的兼容边界
+
+本次新增「多轮 cycle + 恢复侧持续时间 + 去重记忆上界」，以下旧结论保持不变：
+
+- `resolve_for=0`（零值，即旧规则不写该字段）时，恢复行为与旧版完全一致：
+  首个反例立即恢复，恢复通知恰好一次，不经过 `resolving` 状态。
+- 单轮场景（触发一次、恢复一次）的通知次数、静默抑制口径、统计计数与旧版一致，
+  首轮轮次号为 1；旧有用例全部保持绿色。
+- 静默仍然只抑制通知、不改状态与统计，仍然占用**本轮** firing 槽（窗口后不补发旧告警）；
+  变化仅在于槽位作用域从「整条序列」收窄为「每一轮」，使后续轮次不再被旧的静默/去重记忆顶掉。
+- 去重稳定标识在 `AlertKey|SeriesKey` 之后追加 `cycle`，旧版单轮场景等价于 `cycle=1`（外部手工
+  构造、未填轮次的事件按 `cycle=0` 处理，行为与旧版一致）。
+- 唯一的行为变化：同一序列恢复后再次触发现在会走完整流程并再次通知（旧版会被去重吞掉）；
+  以及超出 `DedupRounds` 保留窗口的旧轮次去重记忆会被淘汰（旧版为无限保留）。

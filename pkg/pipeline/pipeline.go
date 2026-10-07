@@ -32,6 +32,9 @@ type Stats struct {
 type Config struct {
 	WindowSize  time.Duration
 	ExtraLabels model.Labels
+	// DedupRounds bounds the notifier's de-duplication memory to the most
+	// recent N trigger cycles per alert key; <= 0 selects the default.
+	DedupRounds int
 }
 
 // Pipeline is the full local metrics/alerting component.
@@ -60,7 +63,7 @@ func New(cfg Config, rec notifier.Recorder) *Pipeline {
 	}
 	p.collector = collector.New(cfg.ExtraLabels)
 	p.aggregator = aggregator.New(cfg.WindowSize)
-	p.notifier = notifier.New(rec, p.silences)
+	p.notifier = notifier.New(rec, p.silences, notifier.WithMaxRounds(cfg.DedupRounds))
 	return p
 }
 
@@ -234,7 +237,7 @@ func (p *Pipeline) Replay() ([]model.Event, Stats, []model.Aggregate, []model.Al
 	agg := aggregator.New(windowSize)
 	eng := engine.New()
 	eng.SetRules(rules)
-	ntf := notifier.New(recorder, silences)
+	ntf := notifier.New(recorder, silences, notifier.WithMaxRounds(p.cfg.DedupRounds))
 
 	var events []model.Event
 	var st Stats

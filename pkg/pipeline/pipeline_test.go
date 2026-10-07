@@ -187,3 +187,231 @@ func TestReplayReproducesAfterSilenceChange(t *testing.T) {
 	t.Logf("basis: replay with new silences -> suppressed %d -> %d, notified %d -> %d",
 		before.Suppressed, after.Suppressed, before.Notified, after.Notified)
 }
+
+// notifyRecord captures one delivered notification for assertions.
+type notifyRecord struct {
+	typ   model.EventType
+	host  string
+	cycle int
+}
+
+type roundSink struct {
+	mu   sync.Mutex
+	recs []notifyRecord
+}
+
+func (r *roundSink) Notify(ev model.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ev.State == nil {
+		return
+	}
+	host, _ := ev.State.Labels.Get("host")
+	r.recs = append(r.recs, notifyRecord{typ: ev.Type, host: host, cycle: ev.State.Cycle})
+}
+
+func (r *roundSink) count(typ model.EventType, host string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, x := range r.recs {
+		if x.typ == typ && x.host == host {
+			n++
+		}
+	}
+	return n
+}
+
+func newRoundPipeline(sink *roundSink, forD, resolveD time.Duration, dedupRounds int) *Pipeline {
+	p := New(Config{WindowSize: 10 * time.Second, DedupRounds: dedupRounds}, sink)
+	p.SetRules([]model.Rule{{
+		ID: "high_cpu", Metric: "cpu.usage", Operator: model.OpGt,
+		Threshold: 90, ForDuration: forD, ResolveDuration: resolveD,
+	}})
+	return p
+}
+
+func ingestLogged(t *testing.T, p *Pipeline, s model.Sample) {
+	t.Helper()
+	evs := p.Ingest(s)
+	for _, ev := range evs {
+		cycle := 0
+		if ev.State != nil {
+			cycle = ev.State.Cycle
+		}
+		t.Logf("input metric=%s v=%.0f ts=%s -> event=%s cycle=%d basis=%s",
+			s.Metric, s.Value, s.Timestamp.Format("15:04:05"), ev.Type, cycle, ev.Detail)
+	}
+}
+
+func TestMultiRoundNotificationsExactlyOnce(t *testing.T) {
+	sink := &roundSink{}
+	p := newRoundPipeline(sink, 10*time.Second, 0, 0)
+
+	// Two full trigger/recover rounds on host a.
+	script := []model.Sample{
+		s1("cpu.usage", "a", "node-a", 95, 0),   // round1 pending
+		s1("cpu.usage", "a", "node-a", 96, 10),  // round1 fires (cycle 1)
+		s1("cpu.usage", "a", "node-a", 97, 12),  // no-op while firing
+		s1("cpu.usage", "a", "node-a", 50, 20),  // round1 resolves (cycle 1)
+		s1("cpu.usage", "a", "node-a", 98, 30),  // round2 pending
+		s1("cpu.usage", "a", "node-a", 99, 41),  // round2 fires (cycle 2)
+		s1("cpu.usage", "a", "node-a", 40, 55),  // round2 resolves (cycle 2)
+	}
+	for _, s := range script {
+		ingestLogged(t, p, s)
+	}
+	// Duplicate re-ingestion of the firing sample must not re-notify.
+	ingestLogged(t, p, s1("cpu.usage", "a", "node-a", 99, 41))
+
+	if n := sink.count(model.EventFiring, "a"); n != 2 {
+		t.Fatalf("want exactly 2 firing notifications (one per round), got %d", n)
+	}
+	if n := sink.count(model.EventResolved, "a"); n != 2 {
+		t.Fatalf("want exactly 2 recovery notifications (one per round), got %d", n)
+	}
+	// Each round is distinguishable by its cycle number.
+	cycles := map[int]bool{}
+	for _, r := range sink.recs {
+		cycles[r.cycle] = true
+	}
+	if !cycles[1] || !cycles[2] {
+		t.Fatalf("notifications must carry their round number, got %+v", sink.recs)
+	}
+	st := p.Stats()
+	if st.Firing != 2 || st.Resolved != 2 {
+		t.Fatalf("stats must count both rounds: %+v", st)
+	}
+	t.Logf("basis: per-round exactly-once; records=%+v stats=%+v", sink.recs, st)
+}
+
+func TestRecoveryFlapDoesNotNotify(t *testing.T) {
+	sink := &roundSink{}
+	p := newRoundPipeline(sink, 0, 10*time.Second, 0)
+
+	script := []model.Sample{
+		s1("cpu.usage", "a", "node-a", 95, 0),  // fires (for=0)
+		s1("cpu.usage", "a", "node-a", 50, 5),  // spike: recovery wait starts
+		s1("cpu.usage", "a", "node-a", 96, 8),  // satisfied again: cancel recovery
+		s1("cpu.usage", "a", "node-a", 40, 12), // wait restarts
+		s1("cpu.usage", "a", "node-a", 93, 15), // flap again: still firing
+		s1("cpu.usage", "a", "node-a", 30, 20), // wait restarts
+		s1("cpu.usage", "a", "node-a", 30, 30), // held 10s -> resolve once
+	}
+	for _, s := range script {
+		ingestLogged(t, p, s)
+	}
+	if n := sink.count(model.EventFiring, "a"); n != 1 {
+		t.Fatalf("flapping recovery must not re-fire, got %d firings", n)
+	}
+	if n := sink.count(model.EventResolved, "a"); n != 1 {
+		t.Fatalf("want exactly 1 recovery after sustained contradiction, got %d", n)
+	}
+	st := p.Stats()
+	if st.Firing != 1 || st.Resolved != 1 {
+		t.Fatalf("stats: %+v", st)
+	}
+	t.Logf("basis: recovery flaps cancelled; notified firing=%d resolved=%d",
+		sink.count(model.EventFiring, "a"), sink.count(model.EventResolved, "a"))
+}
+
+func TestSilenceAcrossRounds(t *testing.T) {
+	sink := &roundSink{}
+	p := newRoundPipeline(sink, 0, 0, 0)
+	// Silence covers [0, 30): round 1 firing is suppressed, round 2 is not.
+	p.SetSilences([]model.Silence{{
+		ID: "maint", Metric: "cpu.usage", Match: map[string]string{"host": "a"},
+		StartsAt: at(0), EndsAt: at(30),
+	}})
+
+	script := []model.Sample{
+		s1("cpu.usage", "a", "node-a", 95, 5),  // round1 fires, silenced
+		s1("cpu.usage", "a", "node-a", 50, 20), // round1 resolves, silenced
+		s1("cpu.usage", "a", "node-a", 96, 35), // round2 fires, window over
+		s1("cpu.usage", "a", "node-a", 40, 45), // round2 resolves
+	}
+	for _, s := range script {
+		ingestLogged(t, p, s)
+	}
+	st := p.Stats()
+	// Silence must not touch state/rounds/stats: both rounds counted.
+	if st.Firing != 2 || st.Resolved != 2 {
+		t.Fatalf("silence must not affect state/stats: %+v", st)
+	}
+	if st.Suppressed != 2 {
+		t.Fatalf("round1 firing+recovery suppressed, want 2 got %d", st.Suppressed)
+	}
+	if n := sink.count(model.EventFiring, "a"); n != 1 {
+		t.Fatalf("round2 firing must be delivered after silence ends, got %d", n)
+	}
+	if n := sink.count(model.EventResolved, "a"); n != 1 {
+		t.Fatalf("round2 recovery must be delivered, got %d", n)
+	}
+	t.Logf("basis: silence only suppresses delivery inside window; stats=%+v", st)
+}
+
+func TestConcurrentMultiRoundEqualsSerial(t *testing.T) {
+	// Multi-round script with recovery flapping and a silence window.
+	build := func() *Pipeline {
+		sink := &roundSink{}
+		p := newRoundPipeline(sink, 10*time.Second, 5*time.Second, 4)
+		p.SetSilences([]model.Silence{{
+			ID: "m-b", Metric: "cpu.usage", Match: map[string]string{"host": "b"},
+			StartsAt: at(0), EndsAt: at(100),
+		}})
+		return p
+	}
+	script := []model.Sample{
+		s1("cpu.usage", "a", "node-a", 95, 0),
+		s1("cpu.usage", "a", "node-a", 96, 10), // a round1 fires
+		s1("cpu.usage", "a", "node-a", 50, 15), // recovery wait starts
+		s1("cpu.usage", "a", "node-a", 97, 18), // flap: cancel recovery
+		s1("cpu.usage", "a", "node-a", 40, 22), // wait restarts
+		s1("cpu.usage", "a", "node-a", 40, 28), // a round1 resolves
+		s1("cpu.usage", "a", "node-a", 98, 40), // a round2
+		s1("cpu.usage", "a", "node-a", 99, 51), // a round2 fires
+		s1("cpu.usage", "a", "node-a", 30, 60),
+		s1("cpu.usage", "a", "node-a", 30, 66), // a round2 resolves
+		s1("cpu.usage", "b", "node-b", 99, 0),
+		s1("cpu.usage", "b", "node-b", 99, 10), // b fires, silenced
+		s1("cpu.usage", "b", "node-b", 10, 20),
+		s1("cpu.usage", "b", "node-b", 10, 26), // b resolves, silenced
+		s1("cpu.usage", "b", "node-b", 99, 120), // b round2, silence over
+		s1("cpu.usage", "b", "node-b", 99, 131), // b round2 fires
+	}
+
+	ser := build()
+	for _, s := range script {
+		ser.Ingest(s)
+	}
+
+	conc := build()
+	var wg sync.WaitGroup
+	for _, s := range script {
+		wg.Add(1)
+		go func(s model.Sample) { defer wg.Done(); conc.Ingest(s) }(s)
+	}
+	wg.Wait()
+
+	e1, st1, _, states1 := ser.Replay()
+	e2, st2, _, states2 := conc.Replay()
+	if st1 != st2 || len(e1) != len(e2) || fmt.Sprint(states1) != fmt.Sprint(states2) {
+		t.Fatalf("concurrent vs serial replay differ:\nserial=%+v (%d events)\nconc=%+v (%d events)",
+			st1, len(e1), st2, len(e2))
+	}
+	// Conclusions: a fires twice + resolves twice; b round1 silenced,
+	// round2 firing delivered after the window.
+	if st1.Notified != 5 || st1.Suppressed != 2 {
+		t.Fatalf("unexpected replay stats: %+v", st1)
+	}
+	for _, ev := range e1 {
+		if ev.Type == model.EventNotified || ev.Type == model.EventSuppressed {
+			cycle := 0
+			if ev.State != nil {
+				cycle = ev.State.Cycle
+			}
+			t.Logf("replay event=%s cycle=%d basis=%s", ev.Type, cycle, ev.Detail)
+		}
+	}
+	t.Logf("basis: concurrent==serial via replay; stats=%+v", st1)
+}
